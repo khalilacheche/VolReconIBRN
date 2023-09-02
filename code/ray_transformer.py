@@ -25,58 +25,93 @@ class PositionEncoding(nn.Module):
         sin_cos_term = rearrange(sin_cos_term, "Num2 L RN SN Dim -> (RN SN) (L Num2 Dim)")
 
         return sin_cos_term
-
+    
+    
+class SourceViewFeaturesMapper(nn.Module):
+    """Simple MLP that maps the N source view features for a 3D point that is on the ray.
+    Input dimension is N x (d + 2) (N source views, d dimensional feature for a source view + 1 for the mean +1 for the variance)
+    Outputs 
+    """
+    def __init__(self,):
+        super().__init__()
+        pass
+        
+@torch.jit.script
+def fused_mean_variance(x, weight):
+    mean = torch.sum(x*weight, dim=2, keepdim=True)
+    var = torch.sum(weight * (x - mean)**2, dim=2, keepdim=True)
+    return mean, var
 
 class RayTransformer(nn.Module):
     """
     Ray transformer
     """
-    def __init__(self, args, img_feat_dim=32, fea_volume_dim=16):
+    def __init__(self, args, img_feat_dim=32):
         super().__init__()
-
+        N_features = 32
         self.args = args
         self.offset =  [[0, 0, 0]]
-
-        self.volume_reso = args.volume_reso
-        self.only_volume = False
-        if self.only_volume:
-            assert self.volume_reso > 0, "if only use volume feature, must have volume"
-
         self.img_feat_dim = img_feat_dim
-        self.fea_volume_dim = fea_volume_dim if self.volume_reso > 0 else 0
         
         self.PE_d_hid = 8
 
         # transformers
-        self.density_view_transformer = LocalFeatureTransformer(d_model=self.img_feat_dim + self.fea_volume_dim, 
+        self.density_ray_transformer = LocalFeatureTransformer(d_model=self.img_feat_dim + self.PE_d_hid, 
                                     nhead=8, layer_names=['self'], attention='linear')
 
-        self.density_ray_transformer = LocalFeatureTransformer(d_model=self.img_feat_dim + self.PE_d_hid + self.fea_volume_dim, 
-                                    nhead=8, layer_names=['self'], attention='linear')
-
-        if self.only_volume:
-            self.DensityMLP = nn.Sequential(
-                nn.Linear(self.fea_volume_dim, 32), nn.ReLU(inplace=True),
-                nn.Linear(32, 16), nn.ReLU(inplace=True),
-                nn.Linear(16, 1))
-        else:
-            self.DensityMLP = nn.Sequential(
-                nn.Linear(self.img_feat_dim + self.PE_d_hid + self.fea_volume_dim, 32), nn.ReLU(inplace=True),
-                nn.Linear(32, 16), nn.ReLU(inplace=True),
-                nn.Linear(16, 1))
-
-        self.relu = nn.ReLU(inplace=True)
-
-        # learnable view token
-        self.viewToken = ViewTokenNetwork(dim=self.img_feat_dim + self.fea_volume_dim)
         self.softmax = nn.Softmax(dim=-2)
 
         # to calculate radiance weight
         self.linear_radianceweight_1_softmax = nn.Sequential(
-            nn.Linear(self.img_feat_dim+3+self.fea_volume_dim, 16), nn.ReLU(inplace=True),
+            nn.Linear(self.img_feat_dim+3, 16), nn.ReLU(inplace=True),
             nn.Linear(16, 8), nn.ReLU(inplace=True),
             nn.Linear(8, 1),
         )
+        #####################
+        self.anti_alias_pooling = args.anti_alias_pooling
+        if self.anti_alias_pooling:
+            self.s = nn.Parameter(torch.tensor(0.2), requires_grad=True)
+        activation_func = nn.ELU(inplace=True)
+        self.ray_dir_fc = nn.Sequential(nn.Linear(3, 16),
+                                        activation_func,
+                                        nn.Linear(16, N_features + 3),
+                                        activation_func)
+
+        self.base_fc = nn.Sequential(nn.Linear((N_features+3)*3, 64),
+                                     activation_func,
+                                     nn.Linear(64, 32),
+                                     activation_func)
+
+        self.vis_fc = nn.Sequential(nn.Linear(32, 32),
+                                    activation_func,
+                                    nn.Linear(32, 33),
+                                    activation_func,
+                                    )
+
+        self.vis_fc2 = nn.Sequential(nn.Linear(32, 32),
+                                     activation_func,
+                                     nn.Linear(32, 1),
+                                     nn.Sigmoid()
+                                     )
+
+        self.geometry_fc = nn.Sequential(nn.Linear(32*2+1, 64),
+                                         activation_func,
+                                         nn.Linear(64, 16),
+                                         activation_func)
+
+        self.out_geometry_fc = nn.Sequential(nn.Linear(16, 16),
+                                             activation_func,
+                                             nn.Linear(16, 1),
+                                             nn.ReLU())
+
+        self.rgb_fc = nn.Sequential(nn.Linear(32+1+4, 16),
+                                    activation_func,
+                                    nn.Linear(16, 8),
+                                    activation_func,
+                                    nn.Linear(8, 1))
+        
+        
+        
 
 
     def order_posenc(self, d_hid, n_samples):
@@ -90,10 +125,12 @@ class RayTransformer(nn.Module):
         return sinusoid_table
 
 
-    def forward(self, point3D, batch, source_imgs_feat, fea_volume=None):
-
+    def forward(self, point3D, batch, source_imgs_feat):
+        #B batch size, NV: number of source views
         B, NV, _, H, W = batch['source_imgs'].shape
+        # RN: Number of rays, SN: Number of samples per ray
         _, RN, SN, _ = point3D.shape
+        #FDim: source views feature
         FDim = source_imgs_feat.size(2) # feature dim
         CN = len(self.offset)
 
@@ -105,13 +142,14 @@ class RayTransformer(nn.Module):
         vector_2 = vector_2/torch.linalg.norm(vector_2, dim=-1, keepdim=True)
         dir_relative = vector_1 - vector_2 
         dir_relative = dir_relative.float()
+        
+        
+        
 
-        if self.args.volume_reso > 0: 
-            assert fea_volume != None
-            fea_volume_feat = grid_sample_3d(fea_volume, point3D.unsqueeze(1).float())
-            fea_volume_feat = rearrange(fea_volume_feat, "B C RN SN -> (B RN SN) C")
+        
+
         # -------- project points to feature map
-        # B NV RN SN CN DimXYZ
+        # B NV RN SN DimXYZ
         point3D = repeat(point3D, "B RN SN DimX -> B NV RN SN DimX", NV=NV).float()
         point3D = torch.cat([point3D, torch.ones_like(point3D[:,:,:,:,:1])], axis=4)
         
@@ -125,7 +163,7 @@ class RayTransformer(nn.Module):
         mask_valid_depth = points_in_pixel[:,:,2]>0  #B NV RN SN
         mask_valid_depth = mask_valid_depth.float()
         points_in_pixel = points_in_pixel[:,:,:2] / points_in_pixel[:,:,2:3]
-
+        #C is source view feature size (FDim)
         img_feat_sampled, mask = grid_sample_2d(rearrange(source_imgs_feat, "B NV C H W -> (B NV) C H W"), 
                                 rearrange(points_in_pixel, "B NV Dim2 RN SN -> (B NV) RN SN Dim2"))
         img_rgb_sampled, _ = grid_sample_2d(rearrange(batch['source_imgs'], "B NV C H W -> (B NV) C H W"), 
@@ -136,35 +174,39 @@ class RayTransformer(nn.Module):
         img_feat_sampled = rearrange(img_feat_sampled, "(B NV) C RN SN -> B NV C RN SN", B=B)
         img_rgb_sampled = rearrange(img_rgb_sampled, "(B NV) C RN SN -> B NV C RN SN", B=B)
 
+
+
+
+        direction_feat = self.ray_dir_fc(dir_relative)
+        if self.anti_alias_pooling:
+            _, dot_prod = torch.split(dir_relative, [3, 1], dim=-1)
+            exp_dot_prod = torch.exp(torch.abs(self.s) * (dot_prod - 1))
+            weight = (exp_dot_prod - torch.min(exp_dot_prod, dim=2, keepdim=True)[0]) * mask
+            weight = weight / (torch.sum(weight, dim=2, keepdim=True) + 1e-8)
+        else:
+            weight = mask / (torch.sum(mask, dim=2, keepdim=True) + 1e-8)
+
+        # compute mean and variance across different views for each point
+        mean, var = fused_mean_variance(img_feat_sampled, weight)  # [n_rays, n_samples, 1, n_feat]
+        globalfeat = torch.cat([mean, var], dim=-1) 
+
+
+
         # --------- run transformer to aggregate information
         # -- 1. view transformer
         x = rearrange(img_feat_sampled, "B NV C RN SN -> (B RN SN) NV C")
-        
-        if self.args.volume_reso > 0: 
-            x_fea_volume_feat = repeat(fea_volume_feat, "B_RN_SN C -> B_RN_SN NV C", NV=NV)
-            x = torch.cat([x, x_fea_volume_feat], axis=-1)
-
-        # add additional view aggregation token
-        view_token = self.viewToken(x)
-        view_token = rearrange(view_token, "B_RN_SN C -> B_RN_SN 1 C")
-        x = torch.cat([view_token, x], axis=1)
-        x = self.density_view_transformer(x)
 
         x1 = rearrange(x, "B_RN_SN NV C -> NV B_RN_SN C")
         x = x1[0] #reference
         view_feature = x1[1:]
 
-        if self.only_volume:
-            x = rearrange(x_fea_volume_feat, "(B RN SN) NV C -> NV (B RN) SN C", B=B, RN=RN, SN=SN)[0]
-        else:
-            # -- 2. ray transformer
-            # add positional encoding
-            x = rearrange(x, "(B RN SN) C -> (B RN) SN C", RN=RN, B=B, SN=SN)
-            x = torch.cat([x, repeat(self.order_posenc(d_hid=self.PE_d_hid, n_samples=SN).type_as(x), 
-                                        "SN C -> B_RN SN C", B_RN = B*RN)], axis=2)
-            x = self.density_ray_transformer(x)        
+        # -- 2. ray transformer
+        # add positional encoding
+        x = rearrange(x, "(B RN SN) C -> (B RN) SN C", RN=RN, B=B, SN=SN)
+        x = torch.cat([x, repeat(self.order_posenc(d_hid=self.PE_d_hid, n_samples=SN).type_as(x), 
+                                    "SN C -> B_RN SN C", B_RN = B*RN)], axis=2)
+        x = self.density_ray_transformer(x)        
 
-        srdf = self.DensityMLP(x)
 
         # calculate weight using view transformers result
         view_feature = rearrange(view_feature, "NV (B RN SN) C -> B RN SN NV C", B=B, RN=RN, SN=SN)
@@ -179,13 +221,5 @@ class RayTransformer(nn.Module):
         radiance = (img_rgb_sampled * rearrange(weight, "B RN SN L 1 -> B L 1 RN SN", B=B, RN=RN)).sum(axis=1)
         radiance = rearrange(radiance, "B DimRGB RN SN -> (B RN SN) DimRGB")
 
-        return radiance, srdf, points_in_pixel  
+        return radiance, points_in_pixel  
 
-
-class ViewTokenNetwork(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.register_parameter('view_token', nn.Parameter(torch.randn([1,dim])))
-
-    def forward(self, x):
-        return torch.ones([len(x), 1]).type_as(x) * self.view_token
