@@ -13,47 +13,10 @@ import math
 PI = math.pi
 
 
-class PositionEncoding(nn.Module):
-    def __init__(self, L=10):
-        super().__init__()
-        self.L = L
-        self.augmented = rearrange(
-            (PI * 2 ** torch.arange(-1, self.L - 1)), "L -> L 1 1 1"
-        )
-
-    def forward(self, x):
-        sin_term = torch.sin(
-            self.augmented.type_as(x) * rearrange(x, "RN SN Dim -> 1 RN SN Dim")
-        )  # BUG?
-        cos_term = torch.cos(
-            self.augmented.type_as(x) * rearrange(x, "RN SN Dim -> 1 RN SN Dim")
-        )
-        sin_cos_term = torch.stack([sin_term, cos_term])
-
-        sin_cos_term = rearrange(
-            sin_cos_term, "Num2 L RN SN Dim -> (RN SN) (L Num2 Dim)"
-        )
-
-        return sin_cos_term
-
-
-class SourceViewFeaturesMapper(nn.Module):
-    """Simple MLP that maps the N source view features for a 3D point that is on the ray.
-    Input dimension is N x (d + 2) (N source views, d dimensional feature for a source view + 1 for the mean +1 for the variance)
-    Outputs
-    """
-
-    def __init__(
-        self,
-    ):
-        super().__init__()
-        pass
-
-
 @torch.jit.script
 def fused_mean_variance(x, weight):
-    mean = torch.sum(x * weight, dim=2, keepdim=True)
-    var = torch.sum(weight * (x - mean) ** 2, dim=2, keepdim=True)
+    mean = torch.sum(x * weight, dim=1, keepdim=True)
+    var = torch.sum(weight * (x - mean) ** 2, dim=1, keepdim=True)
     return mean, var
 
 
@@ -64,23 +27,22 @@ class RayTransformer(nn.Module):
 
     def __init__(self, args, img_feat_dim=32):
         super().__init__()
-        N_features = 32
         self.args = args
+        self.geometry_fc_dim = 16
         self.offset = [[0, 0, 0]]
         self.img_feat_dim = img_feat_dim
 
-        self.PE_d_hid = 8
+        self.PE_d_hid = 16
 
         # transformers
         self.density_ray_transformer = LocalFeatureTransformer(
-            d_model=self.img_feat_dim + self.PE_d_hid,
-            nhead=8,
+            d_model=self.geometry_fc_dim + self.PE_d_hid,
+            nhead=4,
             layer_names=["self"],
             attention="linear",
         )
 
         self.softmax = nn.Softmax(dim=-2)
-
         # to calculate radiance weight
         self.linear_radianceweight_1_softmax = nn.Sequential(
             nn.Linear(self.img_feat_dim + 3, 16),
@@ -95,14 +57,14 @@ class RayTransformer(nn.Module):
             self.s = nn.Parameter(torch.tensor(0.2), requires_grad=True)
         activation_func = nn.ELU(inplace=True)
         self.ray_dir_fc = nn.Sequential(
-            nn.Linear(3, 16),
+            nn.Linear(4, 16),
             activation_func,
-            nn.Linear(16, N_features + 3),
+            nn.Linear(16, self.img_feat_dim + 3),
             activation_func,
         )
 
         self.base_fc = nn.Sequential(
-            nn.Linear((N_features + 3) * 3, 64),
+            nn.Linear((self.img_feat_dim + 3) * 3, 64),
             activation_func,
             nn.Linear(64, 32),
             activation_func,
@@ -122,12 +84,15 @@ class RayTransformer(nn.Module):
         self.geometry_fc = nn.Sequential(
             nn.Linear(32 * 2 + 1, 64),
             activation_func,
-            nn.Linear(64, 16),
+            nn.Linear(64, self.geometry_fc_dim),
             activation_func,
         )
 
         self.out_geometry_fc = nn.Sequential(
-            nn.Linear(16, 16), activation_func, nn.Linear(16, 1), nn.ReLU()
+            nn.Linear(self.geometry_fc_dim + self.PE_d_hid, 16),
+            activation_func,
+            nn.Linear(16, 1),
+            nn.ReLU(),
         )
 
         self.rgb_fc = nn.Sequential(
@@ -138,32 +103,45 @@ class RayTransformer(nn.Module):
             nn.Linear(8, 1),
         )
 
-    def compute_angle(self, xyz, query_camera, train_cameras):
+    def compute_angle(self, point3D, batch_query_camera_T, batch_train_cameras_T):
         """
-        :param xyz: [..., 3]
-        :param query_camera: [34, ]
-        :param train_cameras: [n_views, 34]
-        :return: [n_views, ..., 4]; The first 3 channels are unit-length vector of the difference between
+        Calculates the relative direction between the source views and
+        :param point3D: the samples 3D coordinates, shape: (B,RN,SN,3)
+        :param batch_query_camera_T: the T component of the extrinsic matrix of the query camera (novel view), shape: (B, 3)
+        :param train_cameras: the T components of the extrinsic matrix of the source views cameras, (B, NV, 3)
+        :return: (B,NV, RN, SN, 4); The first 3 channels are unit-length vector of the difference between
         query and target ray directions, the last channel is the inner product of the two directions.
         """
-        original_shape = xyz.shape[:2]
-        xyz = xyz.reshape(-1, 3)
-        train_poses = train_cameras[:, -16:].reshape(-1, 4, 4)  # [n_views, 4, 4]
-        num_views = len(train_poses)
-        query_pose = (
-            query_camera[-16:].reshape(-1, 4, 4).repeat(num_views, 1, 1)
-        )  # [n_views, 4, 4]
-        ray2tar_pose = query_pose[:, :3, 3].unsqueeze(1) - xyz.unsqueeze(0)
-        ray2tar_pose /= torch.norm(ray2tar_pose, dim=-1, keepdim=True) + 1e-6
-        ray2train_pose = train_poses[:, :3, 3].unsqueeze(1) - xyz.unsqueeze(0)
-        ray2train_pose /= torch.norm(ray2train_pose, dim=-1, keepdim=True) + 1e-6
-        ray_diff = ray2tar_pose - ray2train_pose
-        ray_diff_norm = torch.norm(ray_diff, dim=-1, keepdim=True)
-        ray_diff_dot = torch.sum(ray2tar_pose * ray2train_pose, dim=-1, keepdim=True)
-        ray_diff_direction = ray_diff / torch.clamp(ray_diff_norm, min=1e-6)
-        ray_diff = torch.cat([ray_diff_direction, ray_diff_dot], dim=-1)
-        ray_diff = ray_diff.reshape((num_views,) + original_shape + (4,))
-        return ray_diff
+        B, RN, SN, DimX = point3D.shape
+        _, NV, _ = batch_train_cameras_T.shape
+        # calculate relative direction (vector_1: direction between camera origin and point, in world coordinates)
+        vector_1 = point3D - repeat(batch_query_camera_T, "B DimX -> B 1 1 DimX")
+        vector_1 = repeat(vector_1, "B RN SN DimX -> B 1 RN SN DimX")
+        # vector_2: relative direction between source views cameras position and 3d points direction, in world coordinates
+        vector_2 = point3D.unsqueeze(1) - repeat(
+            batch_train_cameras_T, "B L DimX -> B L 1 1 DimX"
+        )  # B L RN SN DimX
+        vector_1 = vector_1 / torch.linalg.norm(
+            vector_1, dim=-1, keepdim=True
+        )  # normalize to get direction
+        vector_2 = vector_2 / torch.linalg.norm(vector_2, dim=-1, keepdim=True)
+        dir_relative = vector_1 - vector_2
+
+        # dot product between the two directions
+        vector_3 = torch.bmm(
+            rearrange(vector_2, "B NV RN SN DimX -> (B NV RN SN) 1 DimX", DimX=DimX),
+            rearrange(
+                repeat(vector_1, "B 1 RN SN DimX -> B NV RN SN DimX", NV=NV),
+                "B NV RN SN DimX -> (B NV RN SN) DimX 1",
+                DimX=3,
+            ),
+        )
+        vector_3 = rearrange(
+            vector_3, "(B NV RN SN) 1 1 -> B NV RN SN 1", NV=NV, RN=RN, B=B, SN=SN
+        )
+        dir_relative = torch.cat([dir_relative, vector_3], dim=-1)
+        dir_relative = dir_relative.float()
+        return dir_relative
 
     def order_posenc(self, d_hid, n_samples):
         def get_position_angle_vec(position):
@@ -191,25 +169,18 @@ class RayTransformer(nn.Module):
         CN = len(self.offset)
 
         # calculate relative direction
-        vector_1 = point3D - repeat(
-            batch["ref_pose_inv"][:, :3, -1], "B DimX -> B 1 1 DimX"
+
+        dir_relative = self.compute_angle(
+            point3D,
+            batch["ref_pose_inv"][
+                :, :3, -1
+            ],  # T component of the inverse extrinsic camera paramteres, corresponding to the query camera position in the world coords
+            batch["source_poses_inv"][:, :, :3, -1],  # source views camera positions
         )
-        vector_1 = repeat(vector_1, "B RN SN DimX -> B 1 RN SN DimX")
-        vector_2 = point3D.unsqueeze(1) - repeat(
-            batch["source_poses_inv"][:, :, :3, -1], "B L DimX -> B L 1 1 DimX"
-        )  # B L RN SN DimX
-        vector_1 = vector_1 / torch.linalg.norm(
-            vector_1, dim=-1, keepdim=True
-        )  # normalize to get direction
-        vector_2 = vector_2 / torch.linalg.norm(vector_2, dim=-1, keepdim=True)
-        dir_relative = vector_1 - vector_2
-        dir_relative = dir_relative.float()
 
         ########
-        ray_diff = self.compute_angle(point3D, batch["ref_pose_inv"], batch["source_poses_inv"])
+        ray_diff = dir_relative
         ########
-
-
 
         # -------- project points to feature map
         # B NV RN SN DimXYZ
@@ -250,16 +221,14 @@ class RayTransformer(nn.Module):
         img_rgb_sampled = rearrange(
             img_rgb_sampled, "(B NV) C RN SN -> B NV C RN SN", B=B
         )
-
-
-        ######################### IBRNET #########################
-        rgb_in = rearrange(img_rgb_sampled, "B NV C RN SN -> B RN SN NV C", B=B)
         direction_feat = self.ray_dir_fc(ray_diff)
-        rgb_feat =  rgb_in
-        # TODO: Add the source view features to the rgb_feat
-        rgb_feat = torch.cat([rgb_feat, direction_feat], axis=-1)
-        # TODO: Add the direction features to the rgb_feat
-        rgb_feat = torch.cat([rgb_feat, direction_feat], axis=-1)
+
+        rgb_in = rearrange(img_rgb_sampled, "B NV C RN SN -> B NV RN SN C", B=B)
+        rgb_feat = rearrange(img_feat_sampled, "B NV C RN SN -> B NV RN SN C", B=B)
+        # Concat the source view features to the rgb values
+        rgb_feat = torch.cat([rgb_feat, rgb_in], axis=-1)
+
+        rgb_feat = rgb_feat + direction_feat
 
         # rgb_feat has the rgb colors, the relative direction and the source view features
 
@@ -267,91 +236,74 @@ class RayTransformer(nn.Module):
             _, dot_prod = torch.split(ray_diff, [3, 1], dim=-1)
             exp_dot_prod = torch.exp(torch.abs(self.s) * (dot_prod - 1))
             weight = (
-                exp_dot_prod - torch.min(exp_dot_prod, dim=2, keepdim=True)[0]
+                exp_dot_prod - torch.min(exp_dot_prod, dim=1, keepdim=True)[0]
             ) * mask
-            weight = weight / (torch.sum(weight, dim=2, keepdim=True) + 1e-8)
+            weight = weight / (torch.sum(weight, dim=1, keepdim=True) + 1e-8)
         else:
-            weight = mask / (torch.sum(mask, dim=2, keepdim=True) + 1e-8)
+            # sum over the views
+            weight = mask / (torch.sum(mask, dim=1, keepdim=True) + 1e-8)
 
+        weight = repeat(weight, "B NV RN SN -> B NV RN SN 1")
         # compute mean and variance across different views for each point
         mean, var = fused_mean_variance(
-            img_feat_sampled, weight
+            rgb_feat, weight
         )  # [n_rays, n_samples, 1, n_feat]
         globalfeat = torch.cat([mean, var], dim=-1)
-        x = torch.cat([repeat(globalfeat, "B RN SN DimX -> B NV RN SN DimX", NV=NV), rgb_feat], dim=-1)  # [n_rays, n_samples, n_views, 3*n_feat]
+        x = torch.cat(
+            [repeat(globalfeat, "B 1 RN SN DimX -> B NV RN SN DimX", NV=NV), rgb_feat],
+            dim=-1,
+        )  # [n_rays, n_samples, n_views, 3*n_feat]
         x = self.base_fc(x)
         x_vis = self.vis_fc(x * weight)
-        x_res, vis = torch.split(x_vis, [x_vis.shape[-1]-1, 1], dim=-1)
+        x_res, vis = torch.split(x_vis, [x_vis.shape[-1] - 1, 1], dim=-1)
+        mask = repeat(mask, "B NV RN SN -> B NV RN SN 1")
         vis = F.sigmoid(vis) * mask
         x = x + x_res
         vis = self.vis_fc2(x * vis) * mask
         weight = vis / (torch.sum(vis, dim=2, keepdim=True) + 1e-8)
         mean, var = fused_mean_variance(x, weight)
-        globalfeat = torch.cat([mean.squeeze(2), var.squeeze(2), weight.mean(dim=2)], dim=-1)  # [n_rays, n_samples, 32*2+1]
+
+        globalfeat = torch.cat(
+            [mean.squeeze(1), var.squeeze(1), weight.mean(dim=1)], dim=-1
+        )  # [n_rays, n_samples, 32*2+1]
+
         globalfeat = self.geometry_fc(globalfeat)  # [n_rays, n_samples, 16]
-        num_valid_obs = torch.sum(mask, dim=2)
-        ####### TODO: addapt the positional encoding to the new input
-        globalfeat = globalfeat + self.pos_encoding
-        ####### TODO: addapt the ray attention to the new input
-        globalfeat, _ = self.ray_attention(globalfeat, globalfeat, globalfeat,
-                                           mask=(num_valid_obs > 1).float())  # [n_rays, n_samples, 16]
-        sigma = self.out_geometry_fc(globalfeat)  # [n_rays, n_samples, 1]
-        sigma_out = sigma.masked_fill(num_valid_obs < 1, 0.)  # set the sigma of invalid point to zero
+        # number of valid observations over the n views
+        num_valid_obs = torch.sum(mask, dim=1)
 
-        # rgb computation
-        x = torch.cat([x, vis, ray_diff], dim=-1)
-        x = self.rgb_fc(x)
-        x = x.masked_fill(mask == 0, -1e9)
-        blending_weights_valid = F.softmax(x, dim=2)  # color blending
-        rgb_out = torch.sum(rgb_in*blending_weights_valid, dim=2)
-        out = torch.cat([rgb_out, sigma_out], dim=-1)
+        globalfeat = rearrange(
+            globalfeat, "B RN SN C -> (B RN) SN C", RN=RN, B=B, SN=SN
+        )
 
-
-        ######################### IBRNET #########################
-
-
-
-
-        # --------- run transformer to aggregate information
-        # -- 1. view transformer
-        x = rearrange(img_feat_sampled, "B NV C RN SN -> (B RN SN) NV C")
-
-        x1 = rearrange(x, "B_RN_SN NV C -> NV B_RN_SN C")
-        x = x1[0]  # reference
-        view_feature = x1[1:]
-
-        # -- 2. ray transformer
-        # add positional encoding
-        x = rearrange(x, "(B RN SN) C -> (B RN) SN C", RN=RN, B=B, SN=SN)
-        x = torch.cat(
+        globalfeat = torch.cat(
             [
-                x,
+                globalfeat,
                 repeat(
-                    self.order_posenc(d_hid=self.PE_d_hid, n_samples=SN).type_as(x),
+                    self.order_posenc(d_hid=self.PE_d_hid, n_samples=SN).type_as(
+                        globalfeat
+                    ),
                     "SN C -> B_RN SN C",
                     B_RN=B * RN,
                 ),
             ],
             axis=2,
         )
-        x = self.density_ray_transformer(x)
+        globalfeat = self.density_ray_transformer(globalfeat)
+        #######
+        sigma = self.out_geometry_fc(globalfeat)  # [n_rays, n_samples, 1]
+        sigma = rearrange(sigma, "(B RN) SN 1 -> B RN SN 1", B=B, RN=RN)
+        sigma_out = sigma.masked_fill(
+            num_valid_obs < 1, 0.0
+        )  # set the sigma of invalid point to zero
 
-        # calculate weight using view transformers result
-        view_feature = rearrange(
-            view_feature, "NV (B RN SN) C -> B RN SN NV C", B=B, RN=RN, SN=SN
+        # rgb computation
+        x = torch.cat([x, vis, ray_diff], dim=-1)
+        x = self.rgb_fc(x)
+        x = x.masked_fill(mask == 0, -1e9)
+        blending_weights_valid = F.softmax(x, dim=2)  # color blending
+        rgb_out = torch.sum(rgb_in * blending_weights_valid, dim=1)
+        out = torch.cat([rgb_out, sigma_out], dim=-1)
+        points_in_pixel = rearrange(
+            points_in_pixel, "B NV Dim2 RN SN -> B NV RN SN Dim2"
         )
-        dir_relative = rearrange(dir_relative, "B NV RN SN Dim3 -> B RN SN NV Dim3")
-
-        x_weight = torch.cat([view_feature, dir_relative], axis=-1)
-        x_weight = self.linear_radianceweight_1_softmax(x_weight)
-        mask = rearrange(mask, "B NV RN SN -> B RN SN NV 1")
-        x_weight[mask == 0] = -1e9
-        weight = self.softmax(x_weight)
-
-        radiance = (
-            img_rgb_sampled
-            * rearrange(weight, "B RN SN L 1 -> B L 1 RN SN", B=B, RN=RN)
-        ).sum(axis=1)
-        radiance = rearrange(radiance, "B DimRGB RN SN -> (B RN SN) DimRGB")
-
-        return radiance, points_in_pixel
+        return out, points_in_pixel
