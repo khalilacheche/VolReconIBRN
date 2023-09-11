@@ -13,7 +13,6 @@ from einops import rearrange, reduce, repeat
 
 from .utils.sampler import FixedSampler, ImportanceSampler
 from .utils.feature_extractor import FPN_FeatureExtractor
-from .utils.single_variance_network import SingleVarianceNetwork
 from .utils.renderer import VolumeRenderer
 
 from .ray_transformer import RayTransformer
@@ -36,7 +35,6 @@ class VolRecon(pl.LightningModule):
         self.feat_extractor = FPN_FeatureExtractor(out_ch=32)
         self.fixed_sampler = FixedSampler(point_num=self.point_num)
         self.importance_sampler = ImportanceSampler(point_num=self.point_num_2)
-        self.deviation_network = SingleVarianceNetwork(0.3)  # add variance network
 
         self.renderer = VolumeRenderer(args)
         self.ray_transformer = RayTransformer(args=args)
@@ -81,16 +79,9 @@ class VolRecon(pl.LightningModule):
 
         ray_d = repeat(ray_d, "RN Dim3 -> RN SN Dim3", SN=SN)
 
-        rgb, depth, opacity, weight, variance = self.renderer.render(
-            z_val, raw, deviation_network=self.deviation_network
-        )
+        rgb, depth, opacity, weight = self.renderer.render(z_val, raw)
 
-        rgb = rearrange(rgb, "(B RN) C -> B RN C", B=B).float()
-        depth = rearrange(depth, "(B RN) -> B RN", B=B)
-        opacity = rearrange(opacity, "(B RN) -> B RN", B=B)
-        weight = rearrange(weight, "(B RN) SN -> B RN SN", B=B)
-
-        return rgb, depth, opacity, weight, points_in_pixel, variance
+        return rgb, depth, opacity, weight, points_in_pixel
 
     def infer(self, batch, ray_idx, source_imgs_feat, extract_geometry=False):
         B, L, _, imgH, imgW = batch["source_imgs"].shape
@@ -146,7 +137,7 @@ class VolRecon(pl.LightningModule):
 
         z_val = rearrange(z_val, "(B RN) SN -> B RN SN", B=B)
 
-        rgb, depth, opacity, weight, points_in_pixel, _ = self.sample2rgb(
+        rgb, depth, opacity, weight, points_in_pixel = self.sample2rgb(
             batch, points_x, z_val, ray_d, ray_idx, source_imgs_feat
         )
 
@@ -180,7 +171,6 @@ class VolRecon(pl.LightningModule):
             opacity_2,
             weight_2,
             points_in_pixel_2,
-            variance,
         ) = self.sample2rgb(
             batch, points_x_all, z_val_all, ray_d, ray_idx, source_imgs_feat
         )
@@ -203,7 +193,6 @@ class VolRecon(pl.LightningModule):
             points_in_pixel_2,
             z_val,
             z_val_all,
-            variance,
         )
 
     def training_step(self, batch, batch_idx):
@@ -235,7 +224,6 @@ class VolRecon(pl.LightningModule):
             points_in_pixel_2,
             z_val,
             z_val_all,
-            variance,
         ) = self.infer(batch=batch, ray_idx=ray_idx, source_imgs_feat=source_imgs_feat)
 
         B, _ = depth_gt.size()
@@ -271,14 +259,12 @@ class VolRecon(pl.LightningModule):
         self.log("train/rgb_coarse", loss_rgb)
         self.log("train/rgb_fine", loss_rgb2)
         self.log("train/loss_all", loss)
-        self.log("train/variance", variance)
 
         return loss
 
     def on_validation_epoch_end(self):
         # average epoches
         batch_parts = self.batch_parts
-        print(batch_parts)
         psnr_coarse = [i["psnr/coarse"] for i in batch_parts]
         psnr_fine = [i["psnr/fine"] for i in batch_parts]
         loss_rgb_coarse = [i["val/loss_rgb_coarse"] for i in batch_parts]
@@ -342,20 +328,17 @@ class VolRecon(pl.LightningModule):
                 rgb_gt,
                 rgb,
                 depth,
-                _,
-                _,
-                _,
-                _,
-                _,
+                depth_gt,
+                opacity,
+                weight,
+                points_in_pixel,
                 rgb_2,
                 depth_2,
-                _,
-                _,
-                _,
-                _,
-                _,
-                _,
-                variance,
+                opacity_2,
+                weight_2,
+                points_in_pixel_2,
+                z_val,
+                z_val_all,
             ) = self.infer(
                 batch=batch, ray_idx=ray_idx, source_imgs_feat=source_imgs_feat
             )
@@ -372,16 +355,11 @@ class VolRecon(pl.LightningModule):
         rgb_list_2 = torch.cat(rgb_list_2, dim=1)
         depth_list_2 = torch.cat(depth_list_2, axis=1)
 
-        # move to cpu
-        to_CPU = lambda x: x.cpu().numpy()
-        variance = to_CPU(variance)
-
         rgb_imgs = rearrange(rgb_list, "B (H W) DimRGB -> B DimRGB H W", H=imgH)
         rgb_gt_imgs = rearrange(rgb_gt_list, "B (H W) DimRGB -> B DimRGB H W", H=imgH)
         depths = rearrange(depth_list, "B (H W) -> B H W", H=imgH)
         rgb_imgs_2 = rearrange(rgb_list_2, "B (H W) DimRGB -> B DimRGB H W", H=imgH)
         depths_2 = rearrange(depth_list_2, "B (H W) -> B H W", H=imgH)
-
         # metrics
         loss_rgb = torch.nn.functional.mse_loss(rgb_list, rgb_gt_list)
         loss_rgb_2 = torch.nn.functional.mse_loss(rgb_list_2, rgb_gt_list)
@@ -423,7 +401,6 @@ class VolRecon(pl.LightningModule):
             "val/loss_depth_fine": loss_depth_ray2.item(),
             "psnr/coarse": psnr_coarse,
             "psnr/fine": psnr_fine,
-            "val/variance": variance,
         }
         self.batch_parts.append(res)
         return res

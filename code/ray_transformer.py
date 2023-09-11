@@ -41,16 +41,6 @@ class RayTransformer(nn.Module):
             layer_names=["self"],
             attention="linear",
         )
-
-        self.softmax = nn.Softmax(dim=-2)
-        # to calculate radiance weight
-        self.linear_radianceweight_1_softmax = nn.Sequential(
-            nn.Linear(self.img_feat_dim + 3, 16),
-            nn.ReLU(inplace=True),
-            nn.Linear(16, 8),
-            nn.ReLU(inplace=True),
-            nn.Linear(8, 1),
-        )
         #####################
         self.anti_alias_pooling = args.anti_alias_pooling
         if self.anti_alias_pooling:
